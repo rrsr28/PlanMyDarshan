@@ -20,8 +20,10 @@ ap.add_argument("csv")
 ap.add_argument("--recent-from", type=int, default=2023,
                 help="year from which data is used for 'when should I go' advice "
                      "(2021-22 were COVID-affected, so they distort normal patterns)")
-ap.add_argument("--min-valid", type=int, default=5000,
-                help="totals below this are treated as bad data")
+ap.add_argument("--min-valid", type=int, default=0,
+                help="totals below this are treated as bad data (default 0: keep real low days such as COVID, eclipses)")
+ap.add_argument("--keep-suspect", action="store_true",
+                help="keep days the scraper flagged as questionable (title and post text disagree, repeated numbers)")
 ap.add_argument("--max-valid", type=int, default=150000,
                 help="totals above this are treated as bad data (e.g. a typo)")
 ap.add_argument("--out", default="ttd_analysis")
@@ -34,17 +36,17 @@ df = pd.read_csv(args.csv, encoding="utf-8-sig", parse_dates=["date"])
 df = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
 df["total_pilgrims"] = pd.to_numeric(df["total_pilgrims"], errors="coerce")
 bad = df[(df.total_pilgrims.isna()) | (df.total_pilgrims < args.min_valid) | (df.total_pilgrims > args.max_valid)]
+if "suspect" in df and not args.keep_suspect:
+    bad = pd.concat([bad, df[df.suspect.fillna(False).astype(bool)]]).drop_duplicates("date")
 bad.to_csv(f"{args.out}/suspect_rows.csv", index=False)
 df = df.drop(bad.index)
 
-# optional: waiting time (hours) parsed from the raw post text
-def wait_hours(t):
-    if not isinstance(t, str): return np.nan
-    m = re.search(r"Sarvadarshanam[^0-9]{0,40}?([\d]+)\s*(?:[-–to]+\s*([\d]+))?\s*H", t, re.I)
-    if not m: return np.nan
-    a = float(m.group(1)); b = float(m.group(2)) if m.group(2) else a
-    return (a + b) / 2
-df["wait_h"] = df.get("raw_text", pd.Series(dtype=object)).map(wait_hours)
+# experimental: posted free-darshan wait (hours) from the scraper's wait_min / wait_max columns.
+# TTD posts it for varying times of day and caps it at 24 H, so it is NOT used for any recommendation.
+if {"wait_min", "wait_max"} <= set(df.columns):
+    df["wait_h"] = (pd.to_numeric(df.wait_min, errors="coerce") + pd.to_numeric(df.wait_max, errors="coerce")) / 2
+else:
+    df["wait_h"] = np.nan
 
 df["year"] = df.date.dt.year
 df["month"] = df.date.dt.month
@@ -185,7 +187,7 @@ if "hundi_cr" in df and df.hundi_cr.notna().any():
 
 if df.wait_h.notna().sum() > 30:
     w = rec.groupby("month").wait_h.mean().round(1); w.index = [MON[i - 1] for i in w.index]
-    say("## Avg Sarvadarshanam waiting time (hours) by month (recent)\n"); say(w.to_markdown()); say()
+    say("## Posted free-darshan wait by month (hours; EXPERIMENTAL, varies by time of day, capped at 24 H)\n"); say(w.to_markdown()); say()
     fig, ax = plt.subplots(figsize=(9, 4)); ax.bar(w.index, w.values, color="#f58518")
     ax.set_title("Average free-darshan waiting time (hours)"); plt.tight_layout()
     plt.savefig(f"{args.out}/wait_by_month.png"); plt.close()

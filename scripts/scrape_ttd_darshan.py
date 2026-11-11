@@ -27,7 +27,26 @@ BASE = "https://news.tirumala.org/category/darshan/page/{}/"
 HEADERS = {"User-Agent": "Mozilla/5.0 (research scraper; contact: you@example.com)"}
 
 DATE_RE = re.compile(r"(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?")
-TOTAL_RE = re.compile(r":\s*([\d,]+)\s*$")
+TOTAL_RE = re.compile(r":\s*(\d[\d,\s]*?)\s*(?:\(.*)?$")      # tolerates "20, 575" and "83,032(note)"
+BODY_RE = re.compile(r"had darshan on\s*[\d./]+\s*:\s*(\d[\d,\s]*?)\s*(?=Tonsures|Hundi|\(|$)", re.I)
+
+
+def _digits(txt):
+    d = re.sub(r"[,\s]", "", txt or "")
+    return int(d) if d.isdigit() else None
+
+
+def total_from(title, body):
+    """Title number, unless the post body disagrees (TTD sometimes mistypes the title, e.g. '87,4346')."""
+    tm = TOTAL_RE.search(title.strip())
+    t = _digits(tm.group(1)) if tm else None
+    bm = BODY_RE.findall(body or "")
+    b = _digits(bm[-1]) if bm else None
+    if t is None:
+        return b
+    if b is not None and b != t:
+        return b
+    return t
 
 
 def num(pattern, text):
@@ -88,13 +107,7 @@ def enrich(row):
         if m.group(3):
             y = int(m.group(3))
             row["_y"] = y + 2000 if y < 100 else y
-    tm = TOTAL_RE.search(t)
-    row["total_pilgrims"] = int(tm.group(1).replace(",", "")) if tm else None
-    # fallback: try body if title lacks the number
-    if row["total_pilgrims"] is None:
-        bm = re.search(r"had darshan on[^:]*:\s*([\d,]+)", row["raw_text"], re.I)
-        if bm:
-            row["total_pilgrims"] = int(bm.group(1).replace(",", ""))
+    row["total_pilgrims"] = total_from(t, row["raw_text"])
     b = row["raw_text"]
     row["tonsures"] = num(r"Tonsures\s*:?\s*([\d,]+)", b)
     row["hundi_cr"] = num(r"Hundi[^:\d]*:?\s*([\d.]+)\s*CR", b)

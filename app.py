@@ -27,14 +27,19 @@ MONTH_FULL = list(calendar.month_name)[1:]
 DOW = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 DEFAULT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ttd_darshan_stats.csv")
 
-# A month needs this many days of data to be ranked against other months.
-# (A half-finished month, e.g. the current one, isn't a fair comparison with a full month.)
-MIN_DAYS = 20
-
 # crowd level palette: label, background, text colour
 LEVELS = [("Quiet", "#2E9E6B", "#FFFFFF"), ("Light", "#9CCB5A", "#1F2D12"), ("Moderate", "#F4D35E", "#3A2E05"),
           ("Busy", "#F2994A", "#FFFFFF"), ("Very busy", "#D64545", "#FFFFFF")]
 CROWD_SCALE = [c[1] for c in LEVELS]
+# Fixed scale (pilgrims per day), chosen from the last 12 months of data (about 76k on an average day:
+# the 10th/40th/60th/90th percentiles are roughly 65k/73k/78k/86k). Not percentiles of the shown days, so if
+# every day is busy the colours say so.
+LEVEL_CUTS = [65_000, 72_000, 80_000, 88_000]
+LEVEL_RANGES = ["under 65k", "65–72k", "72–80k", "80–88k", "88k and above"]
+LEGEND = "".join(f'<span><i style="background:{bg}"></i>{n} · {rg}</span>'
+                 for (n, bg, _), rg in zip(LEVELS, LEVEL_RANGES))
+# A month with fewer days than this is shown on charts but not ranked against full months.
+PARTIAL_DAYS = 20
 
 # ───────────────────────── theme: CSS + plotly template ─────────────────────────
 pio.templates["tirumala"] = go.layout.Template(layout=dict(
@@ -163,18 +168,6 @@ def style(fig, h=420):
 
 
 # ───────────────────────── data ─────────────────────────
-def _wait_hours(t):
-    """Average of the posted free-darshan (Sarvadarshanam) waiting time in hours."""
-    if not isinstance(t, str):
-        return np.nan
-    m = re.search(r"Sarvadarshanam[^0-9]{0,40}?(\d+)\s*(?:[-–to]+\s*(\d+))?\s*H", t, re.I)
-    if not m:
-        return np.nan
-    a = float(m.group(1))
-    b = float(m.group(2)) if m.group(2) else a
-    return (a + b) / 2
-
-
 @st.cache_data(show_spinner=False)
 def load(raw: bytes) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig", parse_dates=["date"])
@@ -182,7 +175,14 @@ def load(raw: bytes) -> pd.DataFrame:
     for c in ["total_pilgrims", "tonsures", "hundi_cr", "laddu_lakh", "annaprasadam_lakh", "aswini_hospital"]:
         if c in df:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["wait_h"] = df["raw_text"].map(_wait_hours) if "raw_text" in df else np.nan
+    # Posted free-darshan wait (hours). Experimental: TTD posts it for varying times of day and caps it at 24 H.
+    if {"wait_min", "wait_max"} <= set(df.columns):
+        df["wait_h"] = (pd.to_numeric(df.wait_min, errors="coerce") + pd.to_numeric(df.wait_max, errors="coerce")) / 2
+    else:
+        df["wait_h"] = np.nan
+    df["suspect"] = df["suspect"].fillna(False).astype(bool) if "suspect" in df else False
+    for c in ("suspect_reason", "data_fix"):
+        df[c] = df[c].fillna("") if c in df else ""
     return df
 
 
@@ -216,17 +216,23 @@ yr_range = st.sidebar.slider(
     "Years to use", y_min, y_max, (max(y_min, 2023), y_max),
     help="Default starts at 2023: 2021 was heavily COVID-affected and Jan–Feb 2022 was still depressed "
          "(~32k–39k/day), which makes those months look falsely quiet.")
-min_valid = st.sidebar.number_input("Ignore daily totals below", 0, 50000, 5000, 500)
+min_valid = st.sidebar.number_input("Ignore daily totals below", 0, 50000, 0, 500,
+    help="Default 0 = nothing is hidden. Real low days (COVID, eclipse closures, storms) are kept.")
 max_valid = st.sidebar.number_input("Ignore daily totals above", 90000, 2_000_000, 150000, 10000)
 normalize = st.sidebar.toggle(
     "Compare each year to its own average", True,
     help="Crowds have grown over the years. Turning this on removes that growth so that months can be "
          "compared fairly. 1.00 = a normal day that year; 0.90 = 10% quieter than normal.")
 quiet_n = st.sidebar.slider("'Quiet month' = one of the quietest N months in a year", 2, 6, 4)
+drop_suspect = st.sidebar.toggle(
+    "Leave out days with questionable data", True,
+    help="TTD's own posts sometimes disagree with themselves (title vs text) or repeat yesterday's number. "
+         "Those days are flagged. Turn this off to include them anyway. The 🔍 Unusual days tab always shows them.")
 
 mask_ok = full.total_pilgrims.between(min_valid, max_valid)
 bad = full[~mask_ok | full.total_pilgrims.isna()]
-df = full[mask_ok].copy()
+keep = mask_ok & ~full.suspect if drop_suspect else mask_ok
+df = full[keep].copy()
 df["year"] = df.date.dt.year
 df = df[df.year.between(*yr_range)].copy()
 if df.empty:
@@ -243,13 +249,22 @@ MVAL = "rel" if normalize else "avg"
 VAL_LABEL = "Crowd vs yearly avg (1.0 = normal)" if normalize else "Pilgrims per day"
 FMT = ".2f" if normalize else ",.0f"
 
+n_susp = int((full.suspect & full.date.dt.year.between(*yr_range)).sum())   # within the selected years
 st.sidebar.caption(f"{len(df):,} days · {df.date.min():%d %b %Y} → {df.date.max():%d %b %Y} · "
-                   f"{len(bad)} suspect rows ignored")
+                   f"{len(bad)} outside your limits · {n_susp} questionable days {'left out' if drop_suspect else 'kept'}")
+n_years = int(df.year.nunique())
+DATA_NOTE = f"Based on {n_years} years of data ({df.year.min()}–{df.year.max()}, {len(df):,} days)."
 
 # ───────────────────────── aggregates ─────────────────────────
-my = (df.groupby(["year", "month"])
-        .agg(avg=("total_pilgrims", "mean"), rel=("rel", "mean"), n=("date", "count")).reset_index())
-my = my[my.n >= MIN_DAYS].copy()
+my_all = (df.groupby(["year", "month"])
+            .agg(avg=("total_pilgrims", "mean"), rel=("rel", "mean"), n=("date", "count")).reset_index())
+my_all["partial"] = my_all.n < PARTIAL_DAYS
+_p = my_all[my_all.partial]
+UNFINISHED_NOTE = ("" if _p.empty else
+    "Every day counts in the averages. " + ", ".join(f"{MON[int(m) - 1]} {int(y)} ({int(n)} days)" for y, m, n in
+                                                    zip(_p.year, _p.month, _p.n)) +
+    " has too few days so far to be compared fairly with full months, so it is shown on charts but not ranked yet.")
+my = my_all[~my_all.partial].copy()                       # full months only: used for ranking and heatmaps
 my["rank"] = my.groupby("year")[MVAL].rank(method="min")
 my["n_in_year"] = my.groupby("year")["month"].transform("count")
 my["pct"] = np.where(my.n_in_year > 1, (my["rank"] - 1) / (my.n_in_year - 1), 0.5)
@@ -257,27 +272,29 @@ my["is_quiet"] = my["rank"] <= quiet_n
 
 wy = (df.groupby(["iso_year", "woy"])
         .agg(avg=("total_pilgrims", "mean"), rel=("rel", "mean"), n=("date", "count")).reset_index())
-wy = wy[wy.n >= 5]
+wy = wy[wy.iso_year.between(*yr_range)]
 wk = (wy.groupby("woy").agg(avg=("avg", "mean"), rel=("rel", "mean"), rel_min=("rel", "min"),
                             rel_max=("rel", "max"), years=("iso_year", "nunique")).reset_index())
 wk["dates"] = wk.woy.map(week_label)
 
 mon = (df.groupby("month").agg(avg=("total_pilgrims", "mean"), median=("total_pilgrims", "median"),
                                 rel=("rel", "mean"), std=("rel", "std"), lo=("total_pilgrims", "min"),
-                                hi=("total_pilgrims", "max"), days=("date", "count"),
-                                wait=("wait_h", "mean")).reset_index())
+                                hi=("total_pilgrims", "max"), days=("date", "count")).reset_index())
 mon["name"] = mon.month.map(lambda m: MON[m - 1])
-HAS_WAIT = df.wait_h.notna().sum() > 30
 
 # ── simple forecasting model: season (week of year, smoothed) x weekday factor ──
-dow_f = df.groupby("dow_i").rel.mean()
+# The date finder ignores extreme one-off days (e.g. eclipse closures) so they don't distort predictions.
+dff = df[df.rel >= 0.55].copy()
+dow_f = dff.groupby("dow_i").rel.mean()
 dow_f = dow_f / dow_f.mean()
-df["seas"] = df.rel / df.dow_i.map(dow_f)
-_s = df.groupby("woy").seas.mean().reindex(range(1, 54)).interpolate(limit_direction="both")
+dff["seas"] = dff.rel / dff.dow_i.map(dow_f)
+_s = dff.groupby("woy").seas.mean().reindex(range(1, 54)).interpolate(limit_direction="both")
 _ext = pd.concat([_s.iloc[-2:], _s, _s.iloc[:2]])
 season = _ext.rolling(3, center=True).mean().iloc[2:-2]
 season.index = range(1, 54)
-_ts = df.set_index("date").total_pilgrims
+dff["_pred_rel"] = dff.woy.map(season).values * dff.dow_i.map(dow_f).values
+BAND_LO, BAND_HI = (dff.rel / dff["_pred_rel"]).quantile([.1, .9]).tolist()   # typical 80% range around a forecast
+_ts = dff.set_index("date").total_pilgrims
 baseline = _ts[_ts.index > _ts.index.max() - pd.Timedelta(days=365)].mean()
 
 
@@ -288,13 +305,11 @@ def predict(dates):
 
 
 today = pd.Timestamp.today().normalize()
-_year_ahead = pd.date_range(today, periods=365)
-_pred_year = predict(_year_ahead)
-DAY_CUTS = np.quantile(_pred_year, [.2, .4, .6, .8])
 
 
-def lvl(v, cuts=DAY_CUTS):
-    return int(np.searchsorted(cuts, v, side="right"))
+def lvl(v):
+    """Crowd level 0 (Quiet) .. 4 (Very busy) on the fixed LEVEL_CUTS scale."""
+    return int(np.searchsorted(LEVEL_CUTS, v, side="right"))
 
 
 def pill(i):
@@ -322,39 +337,42 @@ daily pilgrim counts published by TTD, so you can pick your dates with confidenc
 </div>
 """)
 
-tabs = st.tabs(["🏠 Plan my visit", "📅 Best months", "🗓️ Best weeks", "📈 Timelines",
+tabs = st.tabs(["🏠 Plan my visit", "🔍 Unusual days", "📅 Best months", "🗓️ Best weeks", "📈 Timelines",
                 "🔥 Heatmaps", "🎯 Consistency", "📊 Other stats", "🧹 Data"])
 
 # ═════════════════════════ PLAN MY VISIT ═════════════════════════
 with tabs[0]:
     # ---- the short answer ----
-    best3 = mon.nsmallest(3, "rel")
-    worst2 = mon.nlargest(2, "rel")
-    wd = df.groupby("dow", observed=True).total_pilgrims.mean()
-    best_day, worst_day = wd.idxmin(), wd.idxmax()
-    wkend = df[df.dow_i >= 5].total_pilgrims.mean()
-    wkday = df[df.dow_i < 5].total_pilgrims.mean()
+    now_m = mon.assign(now=mon.rel * baseline)           # typical day in each month, at today's crowd level
+    best3 = now_m.nsmallest(3, "rel")
+    worst2 = now_m.nlargest(2, "rel")
+    wd_now = pd.Series((dow_f * baseline).reindex(range(7)).values, index=DOW)
+    best_day, worst_day = wd_now.idxmin(), wd_now.idxmax()
+    wkday = float(dow_f.reindex(range(5)).mean() * baseline)
+    wkend = float(dow_f.reindex([5, 6]).mean() * baseline)
 
     section("The short answer", "When should I go?",
-            "If you can choose, these are the times when Tirumala has historically had the fewest pilgrims.")
+            f"If you can choose, these are the times that have usually been calmer. {DATA_NOTE} "
+            "These are patterns, not guarantees.")
     html(f"""
     <div class="grid3">
-    <div class="card good"><div class="lab">✅ Quietest months</div>
+    <div class="card good"><div class="lab">✅ Usually the quietest months</div>
     <div class="big">{" · ".join(MONTH_FULL[int(m) - 1] for m in best3.month)}</div>
-    <div class="note">About <b>{k(best3.avg.min())}–{k(best3.avg.max())}</b> pilgrims a day, noticeably fewer than the busy season.</div></div>
-    <div class="card mid"><div class="lab">📆 Best day of the week</div>
+    <div class="note">A typical day has about <b>{k(best3.now.min()) if k(best3.now.min()) == k(best3.now.max()) else k(best3.now.min()) + "–" + k(best3.now.max())}</b> pilgrims at today's crowd levels
+    (an average day is about {k(baseline)}).</div></div>
+    <div class="card mid"><div class="lab">📆 Usually the calmest weekday</div>
     <div class="big">{best_day}</div>
-    <div class="note">Around <b>{k(wd.min())}</b> pilgrims on an average {best_day}, compared with <b>{k(wd.max())}</b> on a {worst_day}.
+    <div class="note">About <b>{k(wd_now.min())}</b> on a typical {best_day}, compared with <b>{k(wd_now.max())}</b> on a {worst_day}.
     Weekdays average {k(wkday)}; weekends {k(wkend)}.</div></div>
-    <div class="card bad"><div class="lab">⚠️ Busiest months</div>
+    <div class="card bad"><div class="lab">⚠️ Usually the busiest months</div>
     <div class="big">{" · ".join(MONTH_FULL[int(m) - 1] for m in worst2.month)}</div>
-    <div class="note">Up to <b>{k(worst2.avg.max())}</b> pilgrims a day on average, and the very busiest days have reached about 98k.</div></div>
+    <div class="note">A typical day has about <b>{k(worst2.now.max())}</b> pilgrims at the peak, and the very busiest days have reached about 98k.</div></div>
     </div>
     """)
 
-    # ---- find my quietest day ----
-    section("Plan your dates", "Find my quietest day",
-            "Tell us when you can travel and we'll rank every day in that window from calmest to busiest.")
+    # ---- find my likely quietest day ----
+    section("Plan your dates", "Find my likely quietest day",
+            "Tell us when you can travel and we'll rank the days in that window from likely calmest to likely busiest.")
     c1, c2 = st.columns([2, 1])
     with c1:
         rng = st.date_input("I can travel between", value=((today + pd.Timedelta(days=14)).date(),
@@ -363,7 +381,8 @@ with tabs[0]:
                             format="DD/MM/YYYY", help="Pick the same date twice to check a single day.")
     with c2:
         skip_we = st.checkbox("Skip Saturdays & Sundays", value=False)
-        st.caption("Estimates use past years' patterns. Festivals aren't predicted.")
+        st.caption(f"Each time of year has only {n_years} past years behind it, so treat this as a guide. "
+                   "Festivals and holidays aren't predicted.")
     if isinstance(rng, (list, tuple)) and len(rng) == 2:
         win = pd.date_range(rng[0], rng[1])
         if skip_we:
@@ -376,28 +395,29 @@ with tabs[0]:
             cards = ""
             for r, i in enumerate(order, 1):
                 d = win[i]
-                wait_txt = ""
-                if HAS_WAIT and not np.isnan(mon.set_index("month").wait.get(d.month, np.nan)):
-                    wait_txt = (f'<div class="w">⏱ Free-darshan wait is typically '
-                                f'~{mon.set_index("month").wait[d.month]:.0f} h in {MON[d.month - 1]}</div>')
                 cards += (f'<div class="rcard"><span class="rk">#{r}</span><div class="d">{d:%d %b %Y}</div>'
                           f'<div class="w">{d:%A}</div>{pill(lvl(pv[i]))}'
-                          f'<div class="p">≈ {k(pv[i])} pilgrims</div>{wait_txt}</div>')
+                          f'<div class="p">usually {k(pv[i] * BAND_LO)}–{k(pv[i] * BAND_HI)} pilgrims</div></div>')
             html(f'<div class="rgrid">{cards}</div>')
 
             fig = go.Figure(go.Bar(
                 x=win, y=pv, marker_color=[LEVELS[lvl(v)][1] for v in pv],
-                customdata=[[f"{d:%A}", LEVELS[lvl(v)][0]] for d, v in zip(win, pv)],
-                hovertemplate="%{x|%d %b %Y} · %{customdata[0]}<br>%{customdata[1]} · ≈ %{y:,.0f} pilgrims<extra></extra>"))
-            fig.update_layout(yaxis_title="Expected pilgrims", bargap=.15,
+                customdata=[[f"{d:%A}", LEVELS[lvl(v)][0], v * BAND_LO, v * BAND_HI] for d, v in zip(win, pv)],
+                hovertemplate=("%{x|%d %b %Y} · %{customdata[0]}<br>%{customdata[1]} · usually "
+                               "%{customdata[2]:,.0f}–%{customdata[3]:,.0f} pilgrims<extra></extra>")))
+            fig.update_layout(yaxis_title="Expected pilgrims (typical)", bargap=.15,
                               yaxis_range=[max(0, pv.min() * .6), pv.max() * 1.08])
             st.plotly_chart(style(fig, 300), width="stretch")
+            st.markdown(f'<div class="legend">{LEGEND}</div>', unsafe_allow_html=True)
 
     # ---- next 12 months calendar ----
-    section("The year ahead", "Crowd calendar", "Green days are the calmest. Hover over a day for details.")
-    leg = "".join(f'<span><i style="background:{bg}"></i>{n}</span>' for n, bg, _ in LEVELS)
-    cal_html = f'<div class="legend">{leg}</div><div class="cgrid">'
+    section("The year ahead", "Crowd calendar",
+            "Colours use a fixed scale (see the key), not rankings, so if every day is busy you'll see mostly orange "
+            f"and red. Hover over a day for details. {DATA_NOTE}")
     first = today.replace(day=1)
+    cal_days = pd.date_range(first, first + pd.DateOffset(months=12) - pd.Timedelta(days=1))
+    cal_pred = dict(zip(cal_days, predict(cal_days)))
+    cal_html = f'<div class="legend">{LEGEND}</div><div class="cgrid">'
     for mi in range(12):
         ms = first + pd.DateOffset(months=mi)
         cells = '<div class="ch">M</div><div class="ch">T</div><div class="ch">W</div><div class="ch">T</div>' \
@@ -411,34 +431,31 @@ with tabs[0]:
                 if d < today:
                     cells += f'<div class="cd past" title="{d:%a %d %b}">{day}</div>'
                     continue
-                v = float(predict([d])[0])
+                v = float(cal_pred[d])
                 n, bg, fg = LEVELS[lvl(v)]
                 cells += (f'<div class="cd" style="background:{bg};color:{fg}" '
-                          f'title="{d:%a %d %b %Y} · {n} (≈{k(v)})">{day}</div>')
+                          f'title="{d:%a %d %b %Y} · {n} (about {k(v)})">{day}</div>')
         cal_html += f'<div class="cal"><div class="cm">{ms:%B %Y}</div><div class="cdays">{cells}</div></div>'
     html(cal_html + "</div>")
 
     # ---- month guide ----
     section("Month by month", "How busy is each month?",
-            "Averages from past years. Even a 'Quiet' month is still a busy temple, just less so.")
-    mcuts = np.quantile(mon.rel, [.2, .4, .6, .8])
+            f"A typical day in each month, scaled to today's crowd level (about {k(baseline)} a day over the last "
+            f"12 months). {DATA_NOTE} Even a calmer month is still a busy temple.")
     tiles = ""
-    for _, r in mon.sort_values("month").iterrows():
-        i = lvl(r.rel, mcuts)
-        n, bg, fg = LEVELS[i]
-        w = f'<div class="mwait">⏱ ~{r.wait:.0f} h free-darshan wait</div>' if HAS_WAIT and not np.isnan(r.wait) else ""
+    for _, r in now_m.sort_values("month").iterrows():
+        n, bg, fg = LEVELS[lvl(r.now)]
         tiles += (f'<div class="mtile" style="--c:{bg}"><div class="mname">{MONTH_FULL[int(r.month) - 1]}</div>'
                   f'<span class="mlevel" style="background:{bg};color:{fg}">{n}</span>'
-                  f'<div class="mnum">≈ {k(r.avg)} <span>/ day</span></div>{w}</div>')
-    html(f'<div class="mgrid">{tiles}</div>')
+                  f'<div class="mnum">about {k(r.now)} <span>/ typical day</span></div></div>')
+    html(f'<div class="legend">{LEGEND}</div><div class="mgrid">{tiles}</div>')
 
     # ---- weekday bars ----
     section("Day by day", "Which day of the week is calmest?")
-    wcuts = np.quantile(wd.values, [.2, .4, .6, .8])
-    mx = wd.max()
+    mx = wd_now.max()
     rows = ""
-    for dname, v in wd.items():
-        _, bg, _ = LEVELS[lvl(v, wcuts)]
+    for dname, v in wd_now.items():
+        _, bg, _ = LEVELS[lvl(v)]
         rows += (f'<div class="wrow"><span class="n">{dname}</span>'
                  f'<div class="wbar"><i style="width:{v / mx * 100:.0f}%;background:{bg}"></i></div>'
                  f'<span class="v">{k(v)}</span></div>')
@@ -446,17 +463,12 @@ with tabs[0]:
 
     # ---- good to know ----
     section("Before you book", "Good to know")
-    low_wait = ""
-    if HAS_WAIT:
-        wmin = mon.loc[mon.wait.idxmin()]
-        low_wait = (f"<li><b>Quiet isn't the same as short.</b> Even in {MONTH_FULL[int(wmin.month) - 1]}, the "
-                    f"calmest month for waiting, free-darshan queues average around {wmin.wait:.0f} hours.</li>")
     html(f"""
     <div class="tips"><ul>
-    <li><b>Weekends are busier.</b> Saturdays and Sundays average about {k(wkend)} pilgrims against {k(wkday)} on weekdays.</li>
+    <li><b>Weekends are busier.</b> Saturdays and Sundays are typically around {k(wkend)} pilgrims against {k(wkday)} on weekdays.</li>
     <li><b>Festivals and school holidays break the pattern.</b> Brahmotsavam, Vaikunta Ekadasi, Sankranti, summer vacation and long weekends can be far busier than any average. Check TTD's official calendar for your dates.</li>
-    {low_wait}
-    <li><b>These are estimates.</b> They come from how crowds behaved in {yr_range[0]}–{yr_range[1]}, adjusted for the weekday and time of year. Crowds have been growing, so expect numbers to be a little higher than past years.</li>
+    <li><b>Quiet isn't the same as short.</b> Free-darshan queues can still run many hours on calmer days. Check TTD's live waiting-time information before you travel.</li>
+    <li><b>These are estimates.</b> {DATA_NOTE} They are adjusted for the weekday and time of year, and scaled to the last 12 months' crowd level, because crowds have been growing.</li>
     <li><b>Not official.</b> This is an independent tool built from the daily statistics TTD publishes at news.tirumala.org.</li>
     </ul></div>
     """)
@@ -464,13 +476,184 @@ with tabs[0]:
         low = df.nsmallest(5, "total_pilgrims")[["date", "dow", "total_pilgrims"]]
         low.columns = ["Date", "Weekday", "Pilgrims"]
         st.dataframe(low.style.format({"Pilgrims": "{:,.0f}", "Date": "{:%d %b %Y}"}), hide_index=True)
-        st.caption("Very low days such as 7 Sep 2025 and 3 Mar 2026 coincide with lunar eclipses, when the temple "
-                   "closes for part of the day. They aren't a reliable 'quiet day' to aim for.")
+        st.caption("Very low days such as 7 Sep 2025 and 3 Mar 2026 were lunar-eclipse closures, when the temple "
+                   "shuts for hours. They aren't a reliable 'quiet day' to aim for. See the 🔍 Unusual days tab "
+                   "for every extreme day and what was reported as the cause.")
     html('<div class="foot">Made with 🙏 · Data: news.tirumala.org · Independent project, not affiliated with TTD</div>')
 
-# ═════════════════════════ BEST MONTHS ═════════════════════════
+# ═════════════════════════ UNUSUAL DAYS ═════════════════════════
+# Entries with a source link were matched to a news report. Entries without one (Diwali dates, COVID-period
+# labels) are general knowledge, not individually sourced. Diwali dates can differ by a day between regions.
+KNOWN = {   # date: (type, what was reported, source URL or "")
+    "2021-11-04": ("Diwali", "Diwali", ""),
+    "2022-10-24": ("Diwali", "Diwali (Deepavali Asthanam at the temple)",
+                   "https://www.sakshipost.com/news/andhrapradesh/tirumala-temple-remain-closed-solar-eclipse-tomorrow-163438"),
+    "2023-11-12": ("Diwali", "Diwali", ""),
+    "2024-10-31": ("Diwali", "Diwali (some regions marked it on 1 Nov)", ""),
+    "2025-10-20": ("Diwali", "Diwali", ""),
+    "2026-11-08": ("Diwali", "Diwali", ""),
+    "2022-10-25": ("Temple closed", "Solar eclipse: temple shut about 11 hours (8:11 am to 7:30 pm)",
+                   "https://thehansindia.com/amp/news/cities/tirupathi/tirumala-temple-to-remain-closed-for-about-12-hrs-on-oct-25-nov-8-760885"),
+    "2022-11-08": ("Temple closed", "Lunar eclipse: temple shut about 11 hours (8:40 am to 7:20 pm)",
+                   "https://www.lokmattimes.com/national/major-temples-in-telugu-states-shut-due-to-lunar-eclipse/amp/"),
+    "2025-09-07": ("Temple closed", "Lunar eclipse: temple shut from 3:30 pm until 3 am",
+                   "https://telanganatoday.com/tirumala-temple-to-remain-closed-due-to-lunar-eclipse-on-september-7"),
+    "2026-03-03": ("Temple closed", "Lunar eclipse: temple shut 9 am to 7:30 pm",
+                   "https://www.deccanherald.com/india/andhra-pradesh/tirumala-temple-to-shut-for-over-10-hours-on-march-3-due-to-lunar-eclipse-3851180"),
+    "2023-10-28": ("Eclipse night", "Partial lunar eclipse that night (no temple-closure report found)", ""),
+    "2021-11-19": ("Flood", "Floods and landslides: temple closed to devotees, ghat roads shut",
+                   "https://www.thequint.com/amp/story/news/india/tirumala-temple-shut-for-devotees-as-flood-causes-landslides-on-ghats"),
+    "2023-12-04": ("Storm", "Cyclone Michaung: heavy rain in Tirumala and Tirupati (4 to 6 Dec)",
+                   "https://deccanchronicle.com/nation/in-other-news/041223/tirumala-dams-full-due-to-heavy-rains-brought-by-cyclone-michaung.html"),
+    "2023-12-05": ("Storm", "Cyclone Michaung: heavy rain in Tirumala and Tirupati (4 to 6 Dec)",
+                   "https://deccanchronicle.com/nation/in-other-news/041223/tirumala-dams-full-due-to-heavy-rains-brought-by-cyclone-michaung.html"),
+    "2023-12-06": ("Storm", "Cyclone Michaung: heavy rain in Tirumala and Tirupati (4 to 6 Dec)",
+                   "https://deccanchronicle.com/nation/in-other-news/041223/tirumala-dams-full-due-to-heavy-rains-brought-by-cyclone-michaung.html"),
+    "2022-12-09": ("Storm", "Cyclone Mandous: heavy rain, darshan hampered",
+                   "https://theprint.in/india/cyclone-mandous-tirupati-temple-premises-waterlogged-devotees-face-problems/1258031"),
+}
+
 with tabs[1]:
+    section("Beyond the averages", "Unusual days",
+            "Averages hide the extremes. Here are the lowest and highest days on record, what caused them, "
+            "and whether festivals like Diwali really change the crowd.")
+    scope = st.radio("Which years?", [f"All years ({y_min}–{y_max})", f"Only {yr_range[0]}–{yr_range[1]} (set in Settings)"],
+                     horizontal=True)
+    valid = full[full.total_pilgrims.between(min_valid, max_valid)].sort_values("date")
+    ser = valid[~valid.suspect].set_index("date").total_pilgrims      # baseline for "normal day" comparisons
+    o = valid.copy()
+    if scope.startswith("Only"):
+        o = o[o.date.dt.year.between(*yr_range)]
+    o = o.reset_index(drop=True)
+
+    def typical(d):
+        vals = [ser.get(d + pd.Timedelta(days=j)) for j in (-21, -14, -7, 7, 14, 21)]
+        vals = [v for v in vals if v is not None and not pd.isna(v)]
+        return float(np.median(vals)) if len(vals) >= 3 else np.nan
+
+    def reason(d, tot):
+        kn = KNOWN.get(f"{d:%Y-%m-%d}")
+        if kn:
+            return kn[1]
+        if pd.Timestamp("2021-04-01") <= d <= pd.Timestamp("2021-07-31") and tot < 20000:
+            return "COVID second-wave period (travel and darshan restrictions)"
+        if pd.Timestamp("2022-01-01") <= d <= pd.Timestamp("2022-02-28") and tot < 40000:
+            return "COVID Omicron-wave period (reduced travel)"
+        return ""
+
+    o["typical"] = o.date.map(typical)
+    o["vs_typical"] = o.total_pilgrims / o.typical - 1
+    o["why"] = [reason(d, t) for d, t in zip(o.date, o.total_pilgrims)]
+    o["ttd_note"] = o["title"].str.extract(r"\(([^)]+)\)")[0].fillna("")
+    o["source"] = o.date.map(lambda d: KNOWN.get(f"{d:%Y-%m-%d}", ("", "", ""))[2])
+    o["dow_name"] = o.date.dt.day_name()
+
+    lo1 = o.loc[o.total_pilgrims.idxmin()]
+    hi1 = o.loc[o.total_pilgrims.idxmax()]
+    n4 = int((o.total_pilgrims < 10000).sum())
+    yrs4 = sorted(o[o.total_pilgrims < 10000].date.dt.year.unique())
+    n_hi = int((o.total_pilgrims >= 90000).sum())
+    n_lo = int((o.total_pilgrims < 50000).sum())
+    yrs4_txt = ", ".join(str(y) for y in yrs4) if yrs4 else "none"
+    html(f"""
+    <div class="grid3">
+    <div class="card bad"><div class="lab">Lowest day on record</div><div class="big">{lo1.total_pilgrims:,.0f}</div>
+    <div class="note">{lo1.date:%a %d %b %Y}. {lo1.why or "No known reason found."}</div></div>
+    <div class="card good"><div class="lab">Busiest day on record</div><div class="big">{hi1.total_pilgrims:,.0f}</div>
+    <div class="note">{hi1.date:%a %d %b %Y}. {hi1.ttd_note or ""}</div></div>
+    <div class="card mid"><div class="lab">Days under 10,000 pilgrims</div><div class="big">{n4}</div>
+    <div class="note">Years it happened: <b>{yrs4_txt}</b>. Four-digit days were a COVID-era thing.</div></div>
+    <div class="card mid"><div class="lab">Days under 50k · over 90k</div><div class="big">{n_lo:,} · {n_hi:,}</div>
+    <div class="note">out of {len(o):,} days in this view.</div></div>
+    </div>
+    """)
+
+    # ---- timeline with the extremes highlighted ----
+    section("Every day, with the extremes marked", "",
+            "Grey line = every day. Red dots = the lowest days (maroon = since COVID), amber dots = the busiest. Hover for the cause.")
+    lows = o.nsmallest(15, "total_pilgrims")
+    lows_post = o[o.date >= "2022-01-01"].nsmallest(10, "total_pilgrims")
+    highs = o.nlargest(10, "total_pilgrims")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=o.date, y=o.total_pilgrims, mode="lines", line=dict(width=1, color="#C9B79C"),
+                             name="Daily", hovertemplate="%{x|%d %b %Y}: %{y:,.0f}<extra></extra>"))
+    for dd, color, nm in [(lows, "#D64545", "Lowest days (mostly COVID 2021)"),
+                          (lows_post, "#7A1F1F", "Lowest days since 2022"), (highs, "#F2994A", "Busiest days")]:
+        fig.add_trace(go.Scatter(
+            x=dd.date, y=dd.total_pilgrims, mode="markers", name=nm,
+            marker=dict(size=11, color=color, line=dict(color="#fff", width=2)),
+            customdata=np.stack([dd.why.replace("", "No known reason found") if nm != "Busiest days" else dd.why.replace("", " "), dd.ttd_note], axis=1),
+            hovertemplate="%{x|%d %b %Y}: %{y:,.0f}<br>%{customdata[0]}<br>%{customdata[1]}<extra></extra>"))
+    fig.update_layout(yaxis_title="Pilgrims per day", legend=dict(orientation="h", y=1.1))
+    st.plotly_chart(style(fig, 430), width="stretch")
+
+    # ---- tables ----
+    def table(dd, blank="No known reason found"):
+        t = dd[["date", "dow_name", "total_pilgrims", "vs_typical", "why", "source", "ttd_note", "suspect_reason"]].copy()
+        t["why"] = t["why"].replace("", blank)
+        t.columns = ["Date", "Weekday", "Pilgrims", "vs a normal day*", "Why (reported)", "Source", "TTD's own note",
+                     "Data check"]
+        return t.style.format({"Date": "{:%d %b %Y}", "Pilgrims": "{:,.0f}", "vs a normal day*": "{:+.0%}"}, na_rep="")
+
+    SRC = {"Source": st.column_config.LinkColumn("Source", display_text=r"https?://(?:www\.)?([^/]+)")}
+    nshow = st.slider("How many days to list", 10, 60, 25)
+    post = o[o.date >= "2022-01-01"]
+    covid = o[o.date < "2022-01-01"]
+    st.markdown("### 🔻 Quietest days since COVID (2022 onwards)")
+    st.dataframe(table(post.nsmallest(nshow, "total_pilgrims")), hide_index=True, width="stretch", column_config=SRC)
+    if len(covid):
+        with st.expander("🔻 Quietest days during COVID (2021)"):
+            st.dataframe(table(covid.nsmallest(nshow, "total_pilgrims")), hide_index=True, width="stretch", column_config=SRC)
+    st.markdown("### 🔺 Busiest days ever")
+    st.dataframe(table(o.nlargest(nshow, "total_pilgrims"), blank="—"), hide_index=True, width="stretch", column_config=SRC)
+    st.caption("*Compared with the median of the same weekday in the 3 weeks before and after (days flagged as "
+               "questionable are not used for that baseline). 'Why (reported)': rows with a Source link are matched to a "
+               "news report; rows without one are general-knowledge labels (e.g. COVID periods, Diwali). "
+               "'No known reason found' means we haven't found a cause. 'Data check' shows where TTD's own title and post text disagree.")
+
+    # ---- did festivals / events change the crowd? ----
+    section("Festival check", "Did Diwali or other events really change the crowd?",
+            "Each event day compared with the same weekday in the 3 weeks before and after.")
+    rows = []
+    for dstr, (typ, desc, _src) in sorted(KNOWN.items()):
+        d = pd.Timestamp(dstr)
+        if d in ser.index and not np.isnan(typical(d)):
+            rows.append({"Type": typ, "Date": d, "Weekday": d.strftime("%a"), "What was reported": desc,
+                         "Pilgrims": ser[d], "Normal for that weekday": typical(d),
+                         "Difference": ser[d] / typical(d) - 1, "Source": KNOWN[dstr][2]})
+    ev = pd.DataFrame(rows)
+    if len(ev):
+        diw = ev[ev.Type == "Diwali"]
+        if len(diw):
+            med = diw.Difference.median()
+            html(f"""
+            <div class="tips"><b>Diwali:</b> across the {len(diw)} Diwali days in the data, attendance was typically
+            <b>{abs(med):.0%} {"lower" if med < 0 else "higher"}</b> than a normal {"day" if len(diw) > 1 else diw.Weekday.iloc[0]} around it
+            (range {diw.Difference.min():+.0%} to {diw.Difference.max():+.0%}). That is only {len(diw)} observations, but it gives no sign
+            that people stay away in large numbers.
+            The big collapses in this table are <b>closures and storms</b>, not festivals.</div>
+            """)
+        st.dataframe(ev.style.format({"Date": "{:%d %b %Y}", "Pilgrims": "{:,.0f}",
+                                      "Normal for that weekday": "{:,.0f}", "Difference": "{:+.0%}"}, na_rep=""),
+                     hide_index=True, width="stretch", column_config=SRC)
+
+    ordinary = o[(o.date >= "2022-01-01") & (o.why == "")]
+    if len(ordinary):
+        om = ordinary.nsmallest(1, "total_pilgrims").iloc[0]
+        html(f"""
+        <div class="tips"><ul>
+        <li><b>So is it always ~50k?</b> No. A normal day is roughly 55k to 90k. Outside COVID, the lowest day with no known cause since 2022
+        was <b>{om.total_pilgrims:,.0f}</b> ({om.date:%d %b %Y}).</li>
+        <li><b>Crashes are rare and have causes:</b> temple closures for eclipses, floods and cyclone rain.
+        Most of the extremely low days in 2021 were the COVID second wave.</li>
+        <li><b>Plan around them:</b> if an eclipse or a cyclone warning falls on your dates, expect disruption, not a calm visit.</li>
+        </ul></div>
+        """)
+
+# ═════════════════════════ BEST MONTHS ═════════════════════════
+with tabs[2]:
     st.subheader("Average crowd by calendar month")
+    st.caption(DATA_NOTE)
     metric = st.radio("Show", ["Average pilgrims/day", "Median pilgrims/day", "Relative to year"], horizontal=True)
     col = {"Average pilgrims/day": "avg", "Median pilgrims/day": "median", "Relative to year": "rel"}[metric]
     d = mon.sort_values("month")
@@ -488,8 +671,10 @@ with tabs[1]:
                  hide_index=True, width="stretch")
 
 # ═════════════════════════ BEST WEEKS ═════════════════════════
-with tabs[2]:
+with tabs[3]:
     st.subheader("Crowd level by week of the year")
+    st.caption(f"{DATA_NOTE} Each week of the year has only {n_years} past years behind it (see the Years column), "
+               "so treat individual weeks as indicative, not exact.")
     topn = st.slider("Highlight the N quietest weeks", 3, 15, 8)
     w = wk.sort_values("woy").copy()
     qset = set(w.nsmallest(topn, "rel").woy)
@@ -514,17 +699,21 @@ with tabs[2]:
                "A narrow gap means the week is reliably that quiet/busy.")
 
 # ═════════════════════════ TIMELINES ═════════════════════════
-with tabs[3]:
+with tabs[4]:
     st.subheader("Monthly timeline")
     mt = df.groupby(df.date.dt.to_period("M")).agg(avg=("total_pilgrims", "mean"), n=("date", "count")).reset_index()
-    mt = mt[mt.n >= MIN_DAYS]
     mt["date"] = mt.date.dt.to_timestamp()
+    mt["partial"] = mt.n < PARTIAL_DAYS
     fig = px.line(mt, x="date", y="avg", markers=True, labels={"avg": "Avg pilgrims/day", "date": ""})
-    lowm = mt.nsmallest(5, "avg")
+    if mt.partial.any():
+        pm = mt[mt.partial]
+        fig.add_trace(go.Scatter(x=pm.date, y=pm.avg, mode="markers", name="Unfinished month (few days so far)",
+                                 marker=dict(size=12, color="rgba(0,0,0,0)", line=dict(color="#7A1F1F", width=2))))
+    lowm = mt[~mt.partial].nsmallest(5, "avg")
     fig.add_trace(go.Scatter(x=lowm.date, y=lowm.avg, mode="markers", marker=dict(color="#2E9E6B", size=13),
                              name="5 quietest months"))
     st.plotly_chart(style(fig, 400), width="stretch")
-    st.caption("Months with fewer than 20 days of data (such as the current, unfinished month) are left out.")
+    st.caption(UNFINISHED_NOTE)
 
     st.subheader("Month-by-month, one line per year")
     d = my.copy()
@@ -553,7 +742,7 @@ with tabs[3]:
     st.plotly_chart(style(fig, 420), width="stretch")
 
 # ═════════════════════════ HEATMAPS ═════════════════════════
-with tabs[4]:
+with tabs[5]:
     st.subheader("Month × year")
     p = my.pivot(index="year", columns="month", values=MVAL).reindex(columns=range(1, 13))
     p.index = p.index.astype(str)
@@ -586,12 +775,11 @@ with tabs[4]:
     st.plotly_chart(style(fig, 350), width="stretch")
 
 # ═════════════════════════ CONSISTENCY ═════════════════════════
-with tabs[5]:
+with tabs[6]:
     st.subheader("🎯 Which months are consistently quiet?")
     st.write(f"For each year the months are ranked from quietest to busiest. A month is **quiet** in a year if it "
              f"is one of that year's **{quiet_n} quietest** months (change in the sidebar settings). "
-             f"A month needs at least {MIN_DAYS} days of data to be ranked, because a half-finished month "
-             f"(like the current one) isn't a fair comparison with a full one.")
+             + UNFINISHED_NOTE)
 
     g = my.groupby("month").agg(
         years=("year", "nunique"), quiet_years=("is_quiet", "sum"), avg_rank=("rank", "mean"),
@@ -668,13 +856,19 @@ with tabs[5]:
     st.plotly_chart(style(fig, 250 * int(np.ceil(d.year.nunique() / 3))), width="stretch")
 
 # ═════════════════════════ OTHER STATS ═════════════════════════
-with tabs[6]:
+with tabs[7]:
     opts = {"Tonsures": "tonsures", "Hundi collection (₹ crore)": "hundi_cr", "Laddu sales (lakh)": "laddu_lakh",
             "Annaprasadam (lakh)": "annaprasadam_lakh", "Aswini hospital patients": "aswini_hospital",
-            "Free-darshan wait (hours)": "wait_h"}
+            "Free-darshan wait (hours, experimental)": "wait_h"}
     opts = {kk: v for kk, v in opts.items() if v in df and df[v].notna().sum() > 30}
     pick = st.selectbox("Metric", list(opts))
     col = opts[pick]
+    if col == "wait_h":
+        _w = df[df.wait_h.notna()]
+        st.warning(f"Experimental. TTD posts the waiting time for varying times of day (e.g. 'after 7am ... 14 H'), "
+                   f"so it is not a reliable measure of a day. It exists for {df.wait_h.notna().mean():.0%} of days and "
+                   f"{(_w.wait_capped == True).mean():.0%} of those show the 24 H display cap. It isn't used for any "
+                   f"recommendation in this app.")
     a, b = st.columns(2)
     with a:
         m = df.groupby("month")[col].mean().reindex(range(1, 13))
@@ -708,15 +902,30 @@ with tabs[6]:
     st.plotly_chart(style(fig, 450), width="stretch")
 
 # ═════════════════════════ DATA ═════════════════════════
-with tabs[7]:
+with tabs[8]:
     st.subheader("Data quality")
     full_range = pd.date_range(full.date.min(), full.date.max())
     missing = full_range.difference(full.date)
-    c = st.columns(3)
+    fixed = full[full["data_fix"] != ""]
+    sus = full[full.suspect]
+    c = st.columns(4)
     c[0].metric("Rows in CSV", f"{len(full):,}")
-    c[1].metric("Suspect rows ignored", len(bad))
+    c[1].metric("Questionable days", len(sus))
     c[2].metric("Missing calendar days", len(missing))
-    st.markdown("**Ignored rows** (outside the min/max limits in the settings)")
+    c[3].metric("Values overridden by hand", len(fixed))
+    if len(sus):
+        with st.expander(f"{len(sus)} questionable days (TTD's title and post text disagree, or the number repeats the day before)"):
+            st.caption(f"Currently {'left out of' if drop_suspect else 'included in'} the analysis (see Settings). "
+                       "The shown total is the number in TTD's post title.")
+            st.dataframe(sus[["date", "total_pilgrims", "body_total", "suspect_reason"]].rename(columns={
+                "total_pilgrims": "Title total", "body_total": "Post-text total", "suspect_reason": "Why flagged"}),
+                hide_index=True, width="stretch")
+    if len(fixed):
+        with st.expander(f"{len(fixed)} values overridden by hand (scripts/overrides.csv)"):
+            st.dataframe(fixed[["date", "total_pilgrims", "data_fix"]].rename(
+                columns={"total_pilgrims": "Used value", "data_fix": "What was fixed"}),
+                hide_index=True, width="stretch")
+    st.markdown("**Rows outside your min/max limits** (Settings)")
     st.dataframe(bad[["date", "total_pilgrims", "title"]], hide_index=True, width="stretch")
     if len(missing):
         with st.expander(f"{len(missing)} missing days"):
